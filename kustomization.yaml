@@ -1,8 +1,9 @@
 configMapGenerator:
 - name: env-injector-files
-  namespace: downstream-llm-d
+  namespace: llm-d-thibrahi
   files:
     - sitecustomize.py
     - profiler_config.yaml
+    - metrics_observer.py
 generatorOptions:
   disableNameSuffixHash: true

@@ -51,6 +51,9 @@ class ProfilerConfig:
         self.target_class: str = "Worker"
         self.target_method: str = "execute_model"
         self.debug: bool = False
+        self.signal_mode: bool = False
+        self.signal_file: str = "/tmp/profiler_start"
+        self.profile_duration: int = 50
 
         self._load_config()
 
@@ -160,6 +163,14 @@ class ProfilerConfig:
         if 'VLLM_PROFILER_DEBUG' in os.environ:
             self.debug = os.environ['VLLM_PROFILER_DEBUG'].lower() in ('true', '1', 'yes')
 
+        # Signal mode
+        if 'VLLM_PROFILER_SIGNAL_MODE' in os.environ:
+            self.signal_mode = os.environ['VLLM_PROFILER_SIGNAL_MODE'].lower() in ('true', '1', 'yes')
+        if 'VLLM_PROFILER_SIGNAL_FILE' in os.environ:
+            self.signal_file = os.environ['VLLM_PROFILER_SIGNAL_FILE']
+        if 'VLLM_PROFILER_DURATION' in os.environ:
+            self.profile_duration = int(os.environ['VLLM_PROFILER_DURATION'])
+
     def _parse_ranges(self, ranges_str: str) -> List[Tuple[int, int]]:
         """
         Parse profiling ranges from string format.
@@ -199,7 +210,86 @@ _config = ProfilerConfig()
 
 
 # ==============================================================================
-# Import Hook
+# NIXL Handshake Recorder
+# ==============================================================================
+
+_NIXL_CONNECTOR_MODULE = "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector"
+
+class NixlHandshakeRecorder:
+    """Records per-call timing of NixlConnector._nixl_handshake."""
+
+    def __init__(self):
+        self.records = []
+        self.output_path = os.environ.get(
+            'VLLM_PROFILER_NIXL_HANDSHAKE_OUTPUT',
+            '/tmp/nixl_handshake_timings.json'
+        )
+        self.enabled = os.environ.get(
+            'VLLM_PROFILER_NIXL_HANDSHAKE', ''
+        ).lower() in ('true', '1', 'yes')
+
+    def wrap(self, original_func):
+        import functools
+        import time
+        recorder = self
+
+        @functools.wraps(original_func)
+        def wrapped(self_connector, host, port, remote_tp_size, expected_engine_id):
+            start = time.monotonic()
+            error_msg = None
+            result = None
+            try:
+                result = original_func(
+                    self_connector, host, port,
+                    remote_tp_size, expected_engine_id
+                )
+                return result
+            except Exception as e:
+                error_msg = str(e)
+                raise
+            finally:
+                elapsed = time.monotonic() - start
+                record = {
+                    "timestamp": time.time(),
+                    "pid": os.getpid(),
+                    "host": host,
+                    "port": port,
+                    "remote_tp_size": remote_tp_size,
+                    "expected_engine_id": expected_engine_id,
+                    "duration_s": round(elapsed, 6),
+                    "success": error_msg is None,
+                    "error": error_msg,
+                    "remote_agents": (
+                        list(result.values()) if result else None
+                    ),
+                }
+                recorder.records.append(record)
+                recorder._flush()
+                print(
+                    f"[nixl-handshake] {host}:{port} "
+                    f"tp={remote_tp_size} "
+                    f"engine={expected_engine_id[:12]}... "
+                    f"dur={elapsed:.3f}s "
+                    f"{'OK' if error_msg is None else 'FAIL'}",
+                    file=sys.stderr
+                )
+
+        return wrapped
+
+    def _flush(self):
+        import json
+        try:
+            with open(self.output_path, 'w') as f:
+                json.dump(self.records, f, indent=2)
+        except Exception as e:
+            print(f"[nixl-handshake] flush error: {e}", file=sys.stderr)
+
+
+_nixl_recorder = NixlHandshakeRecorder()
+
+
+# ==============================================================================
+# Import Hooks
 # ==============================================================================
 
 class PostImportLoader(importlib.abc.Loader):
@@ -238,34 +328,64 @@ class PostImportFinder(importlib.abc.MetaPathFinder):
         return None
 
 
-# Install the import hook
+class NixlPostImportLoader(importlib.abc.Loader):
+    def __init__(self, loader, recorder):
+        self.loader = loader
+        self.recorder = recorder
+
+    def create_module(self, spec):
+        if hasattr(self.loader, "create_module"):
+            return self.loader.create_module(spec)
+        return None
+
+    def exec_module(self, module):
+        self.loader.exec_module(module)
+        nixl_cls = getattr(module, "NixlConnector", None)
+        if nixl_cls is None:
+            print(f"[nixl-handshake] NixlConnector not found in {module.__name__}", file=sys.stderr)
+            return
+        original = getattr(nixl_cls, "_nixl_handshake", None)
+        if original is None:
+            print(f"[nixl-handshake] _nixl_handshake not found on NixlConnector", file=sys.stderr)
+            return
+        setattr(nixl_cls, "_nixl_handshake", self.recorder.wrap(original))
+        print(f"[nixl-handshake] Wrapped NixlConnector._nixl_handshake", file=sys.stderr)
+
+
+class NixlPostImportFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, recorder):
+        self.recorder = recorder
+
+    def find_spec(self, fullname, path, target=None):
+        if fullname != _NIXL_CONNECTOR_MODULE:
+            return None
+
+        sys.meta_path.remove(self)
+        try:
+            spec = importlib.util.find_spec(fullname)
+        finally:
+            sys.meta_path.insert(0, self)
+
+        if spec and spec.loader:
+            spec.loader = NixlPostImportLoader(spec.loader, self.recorder)
+            return spec
+        return None
+
+
+# Install import hooks
 sys.meta_path.insert(0, PostImportFinder())
+if _nixl_recorder.enabled:
+    sys.meta_path.insert(0, NixlPostImportFinder(_nixl_recorder))
 
 
 # ==============================================================================
 # Profiler Wrapper
 # ==============================================================================
 
-def wrap_func_with_profiler(original_func):
-    """
-    Wraps a function with PyTorch profiler that activates for configured ranges.
-
-    Supports multiple profiling windows, e.g., calls 50-100 and 200-300.
-    """
-    import torch
-    import functools
-    from torch.profiler import profile, ProfilerActivity
-
-    # Parse activities
-    activities = []
-    for activity in _config.activities:
-        if activity.upper() == "CPU":
-            activities.append(ProfilerActivity.CPU)
-        elif activity.upper() == "CUDA":
-            activities.append(ProfilerActivity.CUDA)
-
-    # Create profiler instance
-    prof = profile(
+def _make_profiler(activities):
+    """Create a new torch.profiler.profile instance."""
+    from torch.profiler import profile
+    return profile(
         activities=activities,
         record_shapes=_config.record_shapes,
         with_stack=_config.with_stack,
@@ -273,65 +393,101 @@ def wrap_func_with_profiler(original_func):
         with_modules=_config.with_modules
     )
 
-    # Track call count and current profiling range index
+
+def _stop_and_export(prof, start, end):
+    """Stop profiler, print stats, export trace."""
+    prof.stop()
+
+    if _config.print_stats:
+        print("===== begin profiler output")
+        if _config.table_enabled:
+            print(prof.key_averages().table(
+                sort_by=_config.table_sort_by,
+                row_limit=_config.table_row_limit
+            ))
+        print("===== end profiler output")
+
+    if _config.export_chrome_trace:
+        output_file = _config.get_output_filename(range_start=start, range_end=end)
+        prof.export_chrome_trace(output_file)
+        print(f"[profiler] Exported trace to: {output_file}")
+    else:
+        print(f"[profiler] Chrome trace export disabled (export_chrome_trace=false)")
+
+
+def wrap_func_with_profiler(original_func):
+    """
+    Wraps a function with PyTorch profiler.
+
+    Two modes:
+    - Range mode (default): profiles fixed call ranges (e.g., 100-150)
+    - Signal mode: waits for signal file, then profiles for N calls
+    """
+    import functools
+    from torch.profiler import ProfilerActivity
+
+    activities = []
+    for activity in _config.activities:
+        if activity.upper() == "CPU":
+            activities.append(ProfilerActivity.CPU)
+        elif activity.upper() == "CUDA":
+            activities.append(ProfilerActivity.CUDA)
+
+    prof = _make_profiler(activities)
     count = 0
     current_range_idx = 0
     profiling_active = False
+    signal_consumed = False
+    signal_start = 0
+    signal_end = 0
 
     @functools.wraps(original_func)
     def wrapped_func(*args, **kwargs):
         nonlocal count, current_range_idx, profiling_active, prof
+        nonlocal signal_consumed, signal_start, signal_end
 
         count += 1
 
-        # Check if we should start profiling
-        if not profiling_active and current_range_idx < len(_config.ranges):
-            start, end = _config.ranges[current_range_idx]
-            if count == start:
-                print(f"[profiler] Starting profiler for range {start}-{end} (call #{count})")
-                prof.start()
-                profiling_active = True
+        if _config.signal_mode:
+            # Signal mode: wait for signal file to start profiling
+            if not profiling_active and not signal_consumed:
+                if os.path.exists(_config.signal_file):
+                    signal_start = count
+                    signal_end = count + _config.profile_duration
+                    print(f"[profiler] Signal received! Starting profiler for {_config.profile_duration} calls "
+                          f"(calls {signal_start}-{signal_end}, call #{count})")
+                    prof.start()
+                    profiling_active = True
 
-        # Check if we should stop profiling
-        if profiling_active:
-            start, end = _config.ranges[current_range_idx]
-            if count == end:
-                print(f"[profiler] Stopping profiler for range {start}-{end} (call #{count})")
-                prof.stop()
+            if profiling_active and count >= signal_end:
+                print(f"[profiler] Stopping profiler (call #{count}, range {signal_start}-{signal_end})")
+                _stop_and_export(prof, signal_start, signal_end)
                 profiling_active = False
+                signal_consumed = True
+                try:
+                    os.remove(_config.signal_file)
+                except OSError:
+                    pass
+        else:
+            # Range mode: original behavior
+            if not profiling_active and current_range_idx < len(_config.ranges):
+                start, end = _config.ranges[current_range_idx]
+                if count == start:
+                    print(f"[profiler] Starting profiler for range {start}-{end} (call #{count})")
+                    prof.start()
+                    profiling_active = True
 
-                # Print and export results
-                if _config.print_stats:
-                    print("===== begin profiler output")
-                    if _config.table_enabled:
-                        print(prof.key_averages().table(
-                            sort_by=_config.table_sort_by,
-                            row_limit=_config.table_row_limit
-                        ))
-                    print("===== end profiler output")
+            if profiling_active:
+                start, end = _config.ranges[current_range_idx]
+                if count == end:
+                    print(f"[profiler] Stopping profiler for range {start}-{end} (call #{count})")
+                    _stop_and_export(prof, start, end)
+                    profiling_active = False
+                    current_range_idx += 1
 
-                # Optionally export Chrome trace file
-                if _config.export_chrome_trace:
-                    output_file = _config.get_output_filename(range_start=start, range_end=end)
-                    prof.export_chrome_trace(output_file)
-                    print(f"[profiler] Exported trace to: {output_file}")
-                else:
-                    print(f"[profiler] Chrome trace export disabled (export_chrome_trace=false)")
+                    if current_range_idx < len(_config.ranges):
+                        prof = _make_profiler(activities)
 
-                # Move to next range
-                current_range_idx += 1
-
-                # Create new profiler for next range if exists
-                if current_range_idx < len(_config.ranges):
-                    prof = profile(
-                        activities=activities,
-                        record_shapes=_config.record_shapes,
-                        with_stack=_config.with_stack,
-                        profile_memory=_config.profile_memory,
-                        with_modules=_config.with_modules
-                    )
-
-        # Call original function
         result = original_func(*args, **kwargs)
         return result
 
@@ -385,5 +541,10 @@ def unwrap_function():
 # Startup
 # ==============================================================================
 
-print(f"[profiler] vLLM profiler installed - will profile ranges: {_config.ranges}", file=sys.stderr)
+if _config.signal_mode:
+    print(f"[profiler] vLLM profiler installed - signal mode: waiting for {_config.signal_file} (duration={_config.profile_duration} calls)", file=sys.stderr)
+else:
+    print(f"[profiler] vLLM profiler installed - will profile ranges: {_config.ranges}", file=sys.stderr)
 print(f"[profiler] Target: {_config.target_module}.{_config.target_class}.{_config.target_method}", file=sys.stderr)
+if _nixl_recorder.enabled:
+    print(f"[profiler] NIXL handshake recorder enabled → {_nixl_recorder.output_path}", file=sys.stderr)

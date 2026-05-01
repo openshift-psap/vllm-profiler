@@ -32,7 +32,12 @@ FILES_CONFIGMAP_NAME = "env-injector-files"
 FILE_KEYS = [
     {"key": "sitecustomize.py", "mountPath": "/home/vllm/profiler/sitecustomize.py"},
     {"key": "profiler_config.yaml", "mountPath": "/home/vllm/profiler/profiler_config.yaml"},
+    {"key": "metrics_observer.py", "mountPath": "/home/vllm/profiler/metrics_observer.py"},
 ]
+
+OBSERVER_SIDECAR_IMAGE = os.getenv("OBSERVER_SIDECAR_IMAGE", "python:3.11-slim")
+OBSERVER_SHARED_VOLUME_NAME = "profiler-signal"
+OBSERVER_SHARED_MOUNT_PATH = "/tmp"
 
 # Profiler configuration annotation prefix
 PROFILER_ANNOTATION_PREFIX = "vllm.profiler/"
@@ -97,6 +102,11 @@ def extract_profiler_env_from_annotations(annotations: Dict[str, str]) -> List[D
         "output": "VLLM_PROFILER_OUTPUT",
         "export-trace": "VLLM_PROFILER_EXPORT_TRACE",
         "debug": "VLLM_PROFILER_DEBUG",
+        "nixl-handshake": "VLLM_PROFILER_NIXL_HANDSHAKE",
+        "nixl-handshake-output": "VLLM_PROFILER_NIXL_HANDSHAKE_OUTPUT",
+        "signal-mode": "VLLM_PROFILER_SIGNAL_MODE",
+        "signal-file": "VLLM_PROFILER_SIGNAL_FILE",
+        "duration": "VLLM_PROFILER_DURATION",
     }
 
     for annotation_suffix, env_name in annotation_to_env.items():
@@ -251,6 +261,111 @@ def build_files_volume_patch_for_pod(pod: Dict[str, Any]) -> List[Dict[str, Any]
     return patch
 
 
+def extract_observer_env_from_annotations(annotations: Dict[str, str]) -> List[Dict[str, str]]:
+    """Extract observer-specific env vars from pod annotations."""
+    observer_annotation_to_env = {
+        "observer-poll-interval": "METRICS_OBSERVER_POLL_INTERVAL",
+        "observer-window-size": "METRICS_OBSERVER_WINDOW_SIZE",
+        "observer-cv-threshold": "METRICS_OBSERVER_CV_THRESHOLD",
+        "observer-min-throughput": "METRICS_OBSERVER_MIN_THROUGHPUT",
+        "observer-warmup": "METRICS_OBSERVER_WARMUP",
+        "observer-port": "METRICS_OBSERVER_PORT",
+    }
+    env_vars = []
+    for suffix, env_name in observer_annotation_to_env.items():
+        key = f"{PROFILER_ANNOTATION_PREFIX}{suffix}"
+        if key in annotations:
+            env_vars.append({"name": env_name, "value": annotations[key]})
+    return env_vars
+
+
+def detect_vllm_port(pod: Dict[str, Any]) -> str:
+    """Auto-detect vLLM metrics port from pod spec."""
+    for c in pod.get("spec", {}).get("containers", []):
+        if c.get("name") == "vllm":
+            for p in c.get("ports", []):
+                if p.get("name") == "vllm":
+                    return str(p.get("containerPort", 8000))
+    return "8000"
+
+
+def build_observer_sidecar_patch(pod: Dict[str, Any], annotations: Dict[str, str]) -> List[Dict[str, Any]]:
+    """
+    Build JSON patch to inject metrics-observer sidecar container and shared /tmp volume.
+    """
+    patch: List[Dict[str, Any]] = []
+    spec = pod.get("spec", {}) or {}
+    containers = spec.get("containers", [])
+    volumes = spec.get("volumes", [])
+
+    # Check if observer already injected
+    if any(c.get("name") == "metrics-observer" for c in containers):
+        logger.debug("metrics-observer sidecar already present; skipping")
+        return patch
+
+    # Shared /tmp volume
+    shared_vol_present = any(v.get("name") == OBSERVER_SHARED_VOLUME_NAME for v in volumes)
+    if not shared_vol_present:
+        vol_entry = {"name": OBSERVER_SHARED_VOLUME_NAME, "emptyDir": {}}
+        if volumes:
+            patch.append({"op": "add", "path": "/spec/volumes/-", "value": vol_entry})
+        else:
+            patch.append({"op": "add", "path": "/spec/volumes", "value": [vol_entry]})
+
+    # Mount shared /tmp into existing vllm container(s)
+    for idx, c in enumerate(containers):
+        if c.get("name") != "vllm":
+            continue
+        mounts = c.get("volumeMounts", [])
+        already_mounted = any(
+            m.get("name") == OBSERVER_SHARED_VOLUME_NAME for m in mounts
+        )
+        if not already_mounted:
+            mount = {
+                "name": OBSERVER_SHARED_VOLUME_NAME,
+                "mountPath": OBSERVER_SHARED_MOUNT_PATH,
+            }
+            if mounts:
+                patch.append({"op": "add", "path": f"/spec/containers/{idx}/volumeMounts/-", "value": mount})
+            else:
+                patch.append({"op": "add", "path": f"/spec/containers/{idx}/volumeMounts", "value": [mount]})
+
+    # Build observer env vars
+    observer_env = extract_observer_env_from_annotations(annotations)
+    vllm_port = detect_vllm_port(pod)
+    # Auto-set port if not overridden by annotation
+    if not any(e["name"] == "METRICS_OBSERVER_PORT" for e in observer_env):
+        observer_env.append({"name": "METRICS_OBSERVER_PORT", "value": vllm_port})
+
+    # Build sidecar container
+    sidecar = {
+        "name": "metrics-observer",
+        "image": OBSERVER_SIDECAR_IMAGE,
+        "command": ["python", "/home/vllm/profiler/metrics_observer.py"],
+        "env": observer_env,
+        "volumeMounts": [
+            {
+                "name": OBSERVER_SHARED_VOLUME_NAME,
+                "mountPath": OBSERVER_SHARED_MOUNT_PATH,
+            },
+            {
+                "name": FILES_VOLUME_NAME,
+                "mountPath": "/home/vllm/profiler/metrics_observer.py",
+                "subPath": "metrics_observer.py",
+                "readOnly": True,
+            },
+        ],
+        "resources": {
+            "requests": {"cpu": "50m", "memory": "64Mi"},
+            "limits": {"cpu": "200m", "memory": "128Mi"},
+        },
+    }
+
+    patch.append({"op": "add", "path": "/spec/containers/-", "value": sidecar})
+    logger.debug("Observer sidecar patch prepared with port=%s", vllm_port)
+    return patch
+
+
 @app.route("/healthz", methods=["GET"])
 def healthz():
     return "ok", 200
@@ -347,6 +462,12 @@ def mutate():
 
     # Mount configuration files
     patch_ops.extend(build_files_volume_patch_for_pod(obj))
+
+    # Inject observer sidecar if annotation present
+    observer_annotation = f"{PROFILER_ANNOTATION_PREFIX}observer"
+    if annotations.get(observer_annotation, "").lower() in ("true", "1", "yes"):
+        logger.debug("Observer sidecar requested via annotation")
+        patch_ops.extend(build_observer_sidecar_patch(obj, annotations))
 
     if patch_ops:
         logger.debug("Emitting JSONPatch with %d operation(s)", len(patch_ops))
