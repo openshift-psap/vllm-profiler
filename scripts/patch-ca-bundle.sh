@@ -11,11 +11,11 @@ NS="${NS:-vllm-profiler}"
 SVC="${SVC:-env-injector}"
 MWC="${MWC:-env-injector-webhook}"
 
-CA_BUNDLE="$(kubectl -n "${NS}" get secret "${SVC}-certs" -o jsonpath='{.data.tls\.crt}' | base64 -d | base64 -w0)"
+CA_BUNDLE="$(oc -n "${NS}" get secret "${SVC}-certs" -o jsonpath='{.data.tls\.crt}' | base64 -d | base64 -w0)"
 
-kubectl get mutatingwebhookconfiguration "${MWC}" -o json \
+oc get mutatingwebhookconfiguration "${MWC}" -o json \
   | jq --arg ca "${CA_BUNDLE}" '.webhooks[].clientConfig.caBundle = $ca' \
-  | kubectl apply -f -
+  | oc apply -f -
 
 echo "Patched ${MWC} caBundle."
 

@@ -17,18 +17,21 @@ Edit `profiler_config.yaml` and redeploy the ConfigMap:
 
 ```yaml
 # profiler_config.yaml
-profiling_ranges: "50-100,200-300"  # Multiple ranges!
+profiling_ranges: "500-510,2000-2010"  # Multiple ranges!
 activities: "CPU,CUDA"
 options:
   record_shapes: true
-  with_stack: true
+  with_stack: false    # Disabled by default to reduce overhead
   profile_memory: false
+output:
+  export_chrome_trace: true
+  file_pattern: "/tmp/trace_rank{rank}_pid{pid}.json"
 ```
 
 Then update the ConfigMap:
 
 ```bash
-oc delete configmap env-injector-files -n downstream-llm-d
+oc delete configmap env-injector-files -n kserve-e2e-perf
 oc apply -k .
 ```
 
@@ -46,12 +49,12 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: my-vllm-pod
-  namespace: downstream-llm-d
+  namespace: kserve-e2e-perf
   labels:
-    llm-d.ai/inferenceServing: "true"
+    vllm-profiler/enabled: "true"
   annotations:
-    # Profile two ranges: calls 50-100 and 200-300
-    vllm.profiler/ranges: "50-100,200-300"
+    # Profile two ranges: calls 500-510 and 2000-2010
+    vllm.profiler/ranges: "500-510,2000-2010"
 
     # Only profile CUDA activity (skip CPU)
     vllm.profiler/activities: "CUDA"
@@ -60,7 +63,7 @@ metadata:
     vllm.profiler/memory: "true"
 
     # Custom output filename
-    vllm.profiler/output: "my_custom_trace.json"
+    vllm.profiler/output: "/tmp/my_custom_trace_rank{rank}.json"
 
     # Enable debug logging
     vllm.profiler/debug: "true"
@@ -85,22 +88,22 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: my-vllm-pod
-  namespace: downstream-llm-d
+  namespace: kserve-e2e-perf
   labels:
-    llm-d.ai/inferenceServing: "true"
+    vllm-profiler/enabled: "true"
 spec:
   containers:
   - name: vllm
     image: vllm/vllm-openai:latest
     env:
     - name: VLLM_PROFILER_RANGES
-      value: "0-50,100-150"
+      value: "500-510,2000-2010"
     - name: VLLM_PROFILER_ACTIVITIES
       value: "CPU,CUDA"
     - name: VLLM_PROFILER_MEMORY
       value: "true"
     - name: VLLM_PROFILER_OUTPUT
-      value: "trace_pid{pid}_rank{rank}.json"
+      value: "/tmp/trace_rank{rank}_pid{pid}.json"
     # ... rest of container spec
 ```
 
@@ -116,11 +119,13 @@ Specify which model execution calls to profile:
 
 | Method | Example | Effect |
 |--------|---------|--------|
-| ConfigMap | `profiling_ranges: "100-150"` | Profile calls 100-150 |
-| Annotation | `vllm.profiler/ranges: "50-100,200-300"` | Profile 50-100 AND 200-300 |
-| Env Var | `VLLM_PROFILER_RANGES="0-50"` | Profile first 50 calls |
+| ConfigMap | `profiling_ranges: "500-510"` | Profile calls 500-510 |
+| Annotation | `vllm.profiler/ranges: "500-510,2000-2010"` | Profile 500-510 AND 2000-2010 |
+| Env Var | `VLLM_PROFILER_RANGES="500-510"` | Profile calls 500-510 |
 
 **Format:** `"start-end"` or `"start1-end1,start2-end2,..."` for multiple ranges.
+
+**Note:** The profiler uses a gate file mechanism (`/tmp/profiler_gate`). The counter resets each time the gate is activated, so the same range works for every profile run regardless of model speed.
 
 ### Activities
 
@@ -139,7 +144,7 @@ Set to `"true"` or `"false"`:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `record-shapes` / `VLLM_PROFILER_RECORD_SHAPES` | `true` | Record tensor shapes |
-| `with-stack` / `VLLM_PROFILER_WITH_STACK` | `true` | Capture Python stack traces |
+| `with-stack` / `VLLM_PROFILER_WITH_STACK` | `false` | Capture Python stack traces (adds overhead) |
 | `memory` / `VLLM_PROFILER_MEMORY` | `false` | Profile memory allocations |
 | `debug` / `VLLM_PROFILER_DEBUG` | `false` | Enable debug logging |
 
@@ -150,33 +155,32 @@ Customize the output trace filename:
 | Placeholder | Replaced With |
 |-------------|---------------|
 | `{pid}` | Process ID |
-| `{rank}` | Tensor parallel rank (if available) |
+| `{rank}` | Tensor parallel rank (from torch.distributed or LOCAL_RANK) |
 
 **Examples:**
-- `"trace_pid{pid}.json"` → `trace_pid12345.json`
-- `"trace_rank{rank}_pid{pid}.json"` → `trace_rank0_pid12345.json`
-- `"my_profile.json"` → `my_profile.json` (static name)
+- `"/tmp/trace_rank{rank}_pid{pid}.json"` → `/tmp/trace_rank0_pid455.json` (default)
+- `"/tmp/trace_pid{pid}.json"` → `/tmp/trace_pid455.json`
+- `"/tmp/deepseek_steady_state_rank{rank}.json"` → `/tmp/deepseek_steady_state_rank0.json`
 
 ## Common Use Cases
 
-### Use Case 1: Profile startup performance
+### Use Case 1: Steady-state profiling (default)
 
-Profile the first 50 model executions to see initialization overhead:
+Profile 10 forward passes after warmup completes (JIT compilation finishes within ~50 passes, so 500 is well into steady state):
 
-**Annotation:**
+**ConfigMap (current default):**
 ```yaml
-annotations:
-  vllm.profiler/ranges: "0-50"
+profiling_ranges: "500-510"
 ```
 
 ### Use Case 2: Profile multiple windows
 
-Compare performance at different stages (warmup, steady-state, after N requests):
+Compare performance at different stages (warmup, steady-state, late execution):
 
 **Annotation:**
 ```yaml
 annotations:
-  vllm.profiler/ranges: "0-50,100-150,500-550"
+  vllm.profiler/ranges: "50-60,500-510,2000-2010"
 ```
 
 ### Use Case 3: Memory profiling
@@ -187,7 +191,7 @@ Enable memory profiling to find memory leaks or allocations:
 ```yaml
 annotations:
   vllm.profiler/memory: "true"
-  vllm.profiler/ranges: "100-200"  # Longer range for memory analysis
+  vllm.profiler/ranges: "500-600"  # Longer range for memory analysis
 ```
 
 ### Use Case 4: CUDA-only profiling
@@ -201,14 +205,26 @@ annotations:
   vllm.profiler/with-stack: "false"  # Further reduce overhead
 ```
 
-### Use Case 5: Per-rank trace files
+### Use Case 5: Per-rank trace files (tensor parallelism)
 
-When using tensor parallelism, create separate trace files for each rank:
+When using tensor parallelism (e.g., TP=8 for DeepSeek R1), each rank produces its own trace file:
 
-**ConfigMap:**
+**ConfigMap (default behavior):**
 ```yaml
 output:
-  file_pattern: "trace_rank{rank}_pid{pid}.json"
+  file_pattern: "/tmp/trace_rank{rank}_pid{pid}.json"
+```
+
+With TP=8, you'll get 8 trace files: `trace_rank0_pid455.json` through `trace_rank7_pid462.json`.
+
+### Use Case 6: Custom output for A/B comparisons
+
+Use custom filenames to distinguish between experiments:
+
+**Annotation:**
+```yaml
+annotations:
+  vllm.profiler/output: "/tmp/deepseek_r1_rhaiis_3.4_rank{rank}.json"
 ```
 
 ## Testing Configuration
@@ -218,12 +234,12 @@ To test your configuration without creating a full vLLM deployment:
 **1. Check startup messages:**
 
 ```bash
-kubectl logs <pod-name> | grep profiler
+oc logs <pod-name> -n kserve-e2e-perf 2>&1 | grep '\[profiler\]'
 ```
 
 Look for:
 ```
-[profiler] vLLM profiler installed - will profile ranges: [(50, 100), (200, 300)]
+[profiler] vLLM profiler installed - will profile ranges: [(500, 510)]
 ```
 
 **2. Enable debug mode to see configuration details:**
@@ -236,9 +252,9 @@ annotations:
 Then check logs for:
 ```
 [profiler-config] Loaded configuration:
-  Ranges: [(50, 100), (200, 300)]
+  Ranges: [(500, 510), (2000, 2010)]
   Activities: ['CPU', 'CUDA']
-  Output: trace_pid{pid}.json
+  Output: /tmp/trace_rank{rank}_pid{pid}.json
 ```
 
 **3. Verify profiler activation:**
@@ -246,16 +262,14 @@ Then check logs for:
 Watch logs for profiler start/stop messages:
 
 ```bash
-kubectl logs -f <pod-name> | grep -E "\[profiler\]"
+oc logs -f <pod-name> -n kserve-e2e-perf 2>&1 | grep '\[profiler\]'
 ```
 
 Expected output:
 ```
-[profiler] Starting profiler for range 50-100 (call #50)
-[profiler] Stopping profiler for range 50-100 (call #100)
-[profiler] Exported trace to: trace_pid12345.json
-[profiler] Starting profiler for range 200-300 (call #200)
-...
+[profiler] Starting profiler for range 500-510 (call #500)
+[profiler] Stopping profiler for range 500-510 (call #510)
+[profiler] Exported trace to: /tmp/trace_rank0_pid455_range500-510.json
 ```
 
 ## Changing Configuration Without Rebuilding
@@ -267,10 +281,11 @@ Expected output:
 vim profiler_config.yaml
 
 # 2. Update ConfigMap
-oc delete configmap env-injector-files -n downstream-llm-d
+oc delete configmap env-injector-files -n kserve-e2e-perf
 oc apply -k .
 
 # 3. New pods will use new configuration automatically
+# Existing pods need to be restarted
 ```
 
 ### For specific pods (via annotations):
@@ -280,9 +295,9 @@ Just create pods with different annotations - no rebuild needed!
 ```bash
 # Create pod with custom profiling ranges
 kubectl run my-vllm-pod \
-  --namespace=downstream-llm-d \
-  --labels="llm-d.ai/inferenceServing=true" \
-  --annotations="vllm.profiler/ranges=0-100" \
+  --namespace=kserve-e2e-perf \
+  --labels="vllm-profiler/enabled=true" \
+  --annotations="vllm.profiler/ranges=2000-2010" \
   --image=vllm/vllm-openai:latest \
   -- vllm serve <model-name>
 ```
@@ -293,35 +308,42 @@ kubectl run my-vllm-pod \
 
 **Check webhook logs:**
 ```bash
-kubectl logs -n vllm-profiler deployment/env-injector | grep profiler
+oc logs -n vllm-profiler deployment/env-injector | grep profiler
 ```
 
 **Verify annotations were detected:**
 ```
-Found profiler annotation 'vllm.profiler/ranges' -> VLLM_PROFILER_RANGES='50-100,200-300'
+Found profiler annotation 'vllm.profiler/ranges' -> VLLM_PROFILER_RANGES='500-510,2000-2010'
 ```
 
 ### YAML config not loading
 
 **Check if PyYAML is installed in vLLM container:**
 ```bash
-kubectl exec <pod-name> -- python -c "import yaml; print('OK')"
+oc exec <pod-name> -n kserve-e2e-perf -c kserve-container -- python -c "import yaml; print('OK')"
 ```
 
-If PyYAML is missing, configuration will fall back to environment variables.
+If PyYAML is missing, configuration will fall back to environment variables and hardcoded defaults.
 
 ### Wrong profiling ranges
 
 **Check environment variables in pod:**
 ```bash
-kubectl exec <pod-name> -- env | grep VLLM_PROFILER
+oc exec <pod-name> -n kserve-e2e-perf -c kserve-container -- env | grep VLLM_PROFILER
+```
+
+**Check what the ConfigMap has:**
+```bash
+oc get configmap env-injector-files -n kserve-e2e-perf \
+  -o jsonpath='{.data.profiler_config\.yaml}' | grep profiling_ranges
 ```
 
 ## Best Practices
 
 1. **Use ConfigMap for defaults** - Set sensible defaults in profiler_config.yaml
 2. **Use annotations for customization** - Override per pod as needed
-3. **Start with conservative ranges** - Use narrow ranges initially, expand as needed
-4. **Disable stack traces in production** - Set `with-stack: false` to reduce overhead
-5. **Use multiple small ranges** - `"50-60,100-110"` instead of one large `"50-110"`
+3. **Start with conservative ranges** - Use narrow ranges initially (10 calls), expand as needed
+4. **Disable stack traces under load** - `with_stack: false` significantly reduces overhead
+5. **Use the gate file mechanism** - The counter resets on gate activation, making the same range reusable
 6. **Enable debug mode during testing** - Helps verify configuration is applied correctly
+7. **Use per-rank output patterns** - Always include `{rank}` in file_pattern for TP deployments

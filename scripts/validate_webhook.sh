@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 # Validation/troubleshooting for the env-injector mutating webhook.
 # Defaults are tuned for this repo; override via env vars as needed.
 #
@@ -60,11 +62,11 @@ else
   if [ "$CAB_LEN" -eq 0 ]; then
     echo "WARNING: caBundle is empty. API server will not be able to call the webhook."
     if [ "$DO_PATCH" = "1" ]; then
-      if [ -f "./patch-ca-bundle.sh" ]; then
+      if [ -f "${SCRIPT_DIR}/patch-ca-bundle.sh" ]; then
         echo "Patching caBundle using patch-ca-bundle.sh..."
-        NS="$PROFILER_NS" SVC="$SVC" ./patch-ca-bundle.sh || true
+        NS="$PROFILER_NS" SVC="$SVC" "${SCRIPT_DIR}/patch-ca-bundle.sh" || true
       else
-        echo "patch-ca-bundle.sh not found in current directory."
+        echo "patch-ca-bundle.sh not found in scripts directory."
       fi
     fi
   fi

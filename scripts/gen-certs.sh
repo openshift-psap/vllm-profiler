@@ -41,8 +41,8 @@ openssl genrsa -out "${TMP}/tls.key" 2048 >/dev/null 2>&1
 openssl req -new -key "${TMP}/tls.key" -out "${TMP}/server.csr" -config "${TMP}/openssl.cnf" >/dev/null 2>&1
 openssl x509 -req -in "${TMP}/server.csr" -CA "${TMP}/ca.crt" -CAkey "${TMP}/ca.key" -CAcreateserial -out "${TMP}/tls.crt" -days 365 -extensions v3_req -extfile "${TMP}/openssl.cnf" >/dev/null 2>&1
 
-kubectl -n "${NS}" delete secret "${SVC}-certs" --ignore-not-found
-kubectl -n "${NS}" create secret tls "${SVC}-certs" --cert="${TMP}/tls.crt" --key="${TMP}/tls.key"
+oc -n "${NS}" delete secret "${SVC}-certs" --ignore-not-found
+oc -n "${NS}" create secret tls "${SVC}-certs" --cert="${TMP}/tls.crt" --key="${TMP}/tls.key"
 
 echo "CA bundle (base64):"
 base64 -w0 < "${TMP}/ca.crt"

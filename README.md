@@ -16,12 +16,10 @@ This system enables real-time torch profiling of vLLM model execution without re
 
 ```
 ┌─────────────────────────────────────────────────┐
-│ User creates Pod with ANY matching label:       │
-│  - llm-d.ai/inferenceServing=true  OR           │
-│  - app=vllm  OR                                 │
-│  - vllm.profiler/enabled=true                   │
+│ User creates Pod with matching label:           │
+│  - vllm-profiler/enabled=true                   │
 │ Optional annotations for configuration:         │
-│  - vllm.profiler/ranges="50-100,200-300"        │
+│  - vllm.profiler/ranges="500-510"               │
 │  - vllm.profiler/export-trace="false"           │
 └────────────────┬────────────────────────────────┘
                  │
@@ -43,14 +41,15 @@ This system enables real-time torch profiling of vLLM model execution without re
                  │
                  ▼
 ┌─────────────────────────────────────────────────┐
-│ vLLM imports vllm.v1.worker.gpu_worker          │
+│ vLLM imports gpu_worker module                  │
 │  Import hook intercepts & wraps execute_model   │
+│  Supports vLLM >= 0.12 and vLLM 0.11.x         │
 └────────────────┬────────────────────────────────┘
                  │
                  ▼
 ┌─────────────────────────────────────────────────┐
-│ Profiler runs on configured ranges (e.g. 100-150│
-│  Optionally exports: trace_pid{pid}.json        │
+│ Profiler runs on configured ranges (e.g. 500-510│
+│  Exports: /tmp/trace_rank{rank}_pid{pid}.json   │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -67,10 +66,10 @@ This system enables real-time torch profiling of vLLM model execution without re
 
 ```bash
 # Deploy webhook and all components
-./deploy.sh
+./scripts/deploy.sh
 
-# Or skip image build if using existing image
-./deploy.sh --skip-build
+# Or skip image build if using existing image on quay.io
+./scripts/deploy.sh --skip-build
 ```
 
 The deployment script will:
@@ -88,13 +87,13 @@ Edit `manifests.yaml` to configure target namespace and label selectors:
 ```yaml
 env:
   - name: TARGET_NAMESPACE
-    value: "downstream-llm-d"
-  # Multi-label selector (OR logic): pod with ANY of these labels will be instrumented
+    value: "kserve-e2e-perf"
+  # Label selector: pod with this label will be instrumented
   - name: TARGET_LABELS
-    value: "llm-d.ai/inferenceServing=true,app=vllm,vllm.profiler/enabled=true"
+    value: "vllm-profiler/enabled=true"
 ```
 
-The webhook uses **OR logic** - a pod matching ANY of the specified labels will be profiled. No webhook rebuild needed to change labels.
+The webhook uses **OR logic** when multiple labels are specified (comma-separated) - a pod matching ANY of the specified labels will be profiled. No webhook rebuild needed to change labels.
 
 ### Updating Label Selectors Without Rebuilding
 
@@ -103,26 +102,31 @@ You can change the target labels without rebuilding the webhook container:
 ```bash
 # Update TARGET_LABELS environment variable
 oc set env deployment/env-injector -n vllm-profiler \
-  TARGET_LABELS="llm-d.ai/inferenceServing=true,app=vllm,vllm.profiler/enabled=true,role=worker"
+  TARGET_LABELS="vllm-profiler/enabled=true,app=vllm"
 
 # Webhook pod will automatically restart with new configuration
 # Verify new configuration:
 oc logs -n vllm-profiler deployment/env-injector | grep "Target labels"
 ```
 
-This allows you to dynamically add or remove pod types to profile without any downtime.
-
 ### Create Profiled Pod
 
-Create a vLLM pod in the target namespace with a matching label:
+Create a vLLM pod in the target namespace with the matching label:
 
 ```bash
-# Basic: Pod will automatically be injected with default profiler configuration
+# Basic: Pod will automatically be injected with profiler
 kubectl run my-vllm-pod \
-  -n downstream-llm-d \
-  --labels="llm-d.ai/inferenceServing=true" \
+  -n kserve-e2e-perf \
+  --labels="vllm-profiler/enabled=true" \
   --image=vllm/vllm-openai:latest \
   -- vllm serve <model-name>
+```
+
+Or use a pre-built server config from `server_configs/`:
+
+```bash
+# Deploy DeepSeek R1 with profiling enabled
+oc apply -f server_configs/deepseek-r1-rhaiis-3.4-EA1.yaml
 ```
 
 Or use pod annotations for custom profiler configuration:
@@ -132,12 +136,12 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: my-vllm-pod
-  namespace: downstream-llm-d
+  namespace: kserve-e2e-perf
   labels:
-    app: vllm  # Matches one of the target labels
+    vllm-profiler/enabled: "true"
   annotations:
     # Custom profiling ranges (multiple windows)
-    vllm.profiler/ranges: "50-100,200-300"
+    vllm.profiler/ranges: "500-510,2000-2010"
     # Disable trace file export (reduce I/O)
     vllm.profiler/export-trace: "false"
     # Enable debug logging
@@ -151,27 +155,35 @@ spec:
 
 ### View Profiler Output
 
-The profiler activates automatically after 100 model execution calls:
+The profiler activates after the configured number of model execution calls (default: call #500):
 
 ```bash
-# Watch for profiler output (calls 100-150)
-kubectl logs -n downstream-llm-d <pod-name> -f | grep -A 50 "begin profiler output"
+# Watch for profiler output
+oc logs -n kserve-e2e-perf <pod-name> -f 2>&1 | grep '\[profiler\]'
 
-# Retrieve trace file for visualization
-kubectl cp downstream-llm-d/<pod-name>:/path/to/trace<pid>.json ./trace.json
+# Expected sequence:
+# [profiler] vLLM profiler installed - will profile ranges: [(500, 510)]
+# [profiler] Starting profiler for range 500-510 (call #500)
+# [profiler] Stopping profiler for range 500-510 (call #510)
+# [profiler] Exported trace to: /tmp/trace_rank0_pid455_range500-510.json
 
-# Open in Chrome
-# Navigate to chrome://tracing and load trace.json
+# Retrieve trace files
+oc exec -n kserve-e2e-perf <pod-name> -c kserve-container -- \
+  bash -c 'tar cf - /tmp/trace_rank*.json' \
+  | tar xf - -C profiles/<run-name>/ --strip-components=1
+
+# Open in Chrome: navigate to chrome://tracing and load trace.json
+# Or use Perfetto: https://ui.perfetto.dev
 ```
 
 ### Teardown
 
 ```bash
 # Remove all webhook resources
-./teardown.sh
+TARGET_NAMESPACE=kserve-e2e-perf ./scripts/teardown.sh
 
 # Or skip confirmation prompt
-./teardown.sh --force
+TARGET_NAMESPACE=kserve-e2e-perf ./scripts/teardown.sh --force
 ```
 
 ## Project Structure
@@ -185,16 +197,27 @@ vllm-profiler/
 ├── kustomization.yaml          # ConfigMap generator
 ├── Dockerfile                  # Webhook container image
 ├── requirements.txt            # Python dependencies
-├── deploy.sh                   # Deployment automation script
-├── teardown.sh                 # Cleanup script
-├── gen-certs.sh                # TLS certificate generation
-├── patch-ca-bundle.sh          # Webhook CA bundle patching
-├── validate_webhook.sh         # Validation tool
-├── test-vllm-integration.sh    # End-to-end integration test
-├── test-profiler.sh            # Standalone profiler testing
-├── test-profiler-features.yaml # Feature testing examples
+├── AGENTS.md                   # Agent deployment instructions
 ├── CONFIGURATION_EXAMPLES.md   # Configuration guide
-└── README.md                   # This file
+├── README.md                   # This file
+├── demo-vllm-profiler.ipynb    # Interactive walkthrough notebook
+├── scripts/
+│   ├── deploy.sh               # Full deployment automation
+│   ├── teardown.sh             # Cleanup script
+│   ├── gen-certs.sh            # TLS certificate generation
+│   ├── patch-ca-bundle.sh      # Webhook CA bundle patching
+│   └── validate_webhook.sh     # Validation tool
+├── tests/
+│   ├── test-profiler.sh        # Standalone profiler testing
+│   ├── test-vllm-integration.sh # End-to-end integration test
+│   └── test-profiler-features.yaml # Feature testing examples
+├── server_configs/             # Pre-built KServe manifests for models
+│   ├── deepseek-r1-rhaiis-3.4-EA1.yaml
+│   ├── gptoss-vllm-v0.17.0.yaml
+│   └── ...                     # Various model/version combos
+├── analysis/                   # Profile comparison scripts
+├── profiles/                   # Collected trace files (local)
+└── logs/                       # Profiling session logs
 ```
 
 ## How It Works
@@ -203,7 +226,7 @@ vllm-profiler/
 
 Flask-based mutating webhook that:
 - Listens for Pod CREATE operations
-- Filters by namespace and **multiple label selectors (OR logic)**
+- Filters by namespace and **label selectors (OR logic)**
 - Extracts profiler configuration from pod annotations
 - Converts annotations to environment variables
 - Injects `PYTHONPATH=/home/vllm/profiler` environment variable
@@ -217,10 +240,11 @@ Python module that:
   1. Environment variables (highest priority)
   2. `profiler_config.yaml` file
   3. Hardcoded defaults (lowest priority)
-- Installs a `sys.meta_path` finder to intercept `vllm.v1.worker.gpu_worker` import
+- Installs a `sys.meta_path` finder to intercept vLLM worker module imports
+- Supports multiple vLLM versions (>= 0.12 via `vllm.v1.worker.gpu_worker`, 0.11.x via `vllm.worker.worker`)
 - Wraps `Worker.execute_model` with torch.profiler
 - Records CPU+CUDA activity for configured call ranges
-- Optionally exports Chrome trace JSON file
+- Exports Chrome trace JSON file per rank
 
 ### 3. Profiler Configuration
 
@@ -228,28 +252,28 @@ Configuration is managed via `ProfilerConfig` class with multi-source support:
 
 **Default settings** (from profiler_config.yaml):
 ```yaml
-profiling_ranges: "100-150"  # Can specify multiple: "50-100,200-300"
+profiling_ranges: "500-510"     # Steady-state profiling (10 forward passes)
 activities: "CPU,CUDA"
 options:
   record_shapes: true
-  with_stack: true
+  with_stack: false             # Disabled to reduce overhead under load
   profile_memory: false
 output:
-  export_chrome_trace: true  # Set false to disable trace export
-  file_pattern: "trace_pid{pid}.json"
+  export_chrome_trace: true
+  file_pattern: "/tmp/trace_rank{rank}_pid{pid}.json"
 ```
 
 **Per-pod override** (via annotations):
 ```yaml
 annotations:
-  vllm.profiler/ranges: "50-100,200-300"      # Multiple profiling windows
-  vllm.profiler/export-trace: "false"         # Disable trace export
-  vllm.profiler/debug: "true"                 # Enable debug logging
+  vllm.profiler/ranges: "500-510,2000-2010"   # Multiple profiling windows
+  vllm.profiler/export-trace: "false"          # Disable trace export
+  vllm.profiler/debug: "true"                  # Enable debug logging
   vllm.profiler/activities: "CPU,CUDA"
   vllm.profiler/record-shapes: "true"
   vllm.profiler/with-stack: "true"
   vllm.profiler/memory: "false"
-  vllm.profiler/output: "custom_trace.json"
+  vllm.profiler/output: "/tmp/custom_trace.json"
 ```
 
 See [CONFIGURATION_EXAMPLES.md](CONFIGURATION_EXAMPLES.md) for comprehensive configuration guide.
@@ -259,7 +283,7 @@ See [CONFIGURATION_EXAMPLES.md](CONFIGURATION_EXAMPLES.md) for comprehensive con
 ### Environment Variables
 
 **Webhook Configuration:**
-- `TARGET_NAMESPACE`: Namespace to target (default: "downstream-llm-d")
+- `TARGET_NAMESPACE`: Namespace to target (default: "kserve-e2e-perf")
 - `TARGET_LABELS`: Comma-separated label selectors with OR logic (e.g., "key1=val1,key2=val2")
 - `TARGET_LABEL_KEY`: Legacy single label key (deprecated, use TARGET_LABELS)
 - `TARGET_LABEL_VALUE`: Legacy single label value (deprecated, use TARGET_LABELS)
@@ -271,9 +295,10 @@ See [CONFIGURATION_EXAMPLES.md](CONFIGURATION_EXAMPLES.md) for comprehensive con
 - `CONTAINER_RUNTIME`: Container runtime to use (default: "podman")
 - `IMAGE_REGISTRY`: Image registry (default: "quay.io/mimehta")
 - `IMAGE_TAG`: Image tag (default: "latest")
+- `TARGET_NAMESPACE`: Target namespace for ConfigMap (default: "kserve-e2e-perf")
 
 **Profiler Configuration (injected via pod annotations or set manually):**
-- `VLLM_PROFILER_RANGES`: Profiling call ranges (e.g., "100-150" or "50-100,200-300")
+- `VLLM_PROFILER_RANGES`: Profiling call ranges (e.g., "500-510" or "500-510,2000-2010")
 - `VLLM_PROFILER_ACTIVITIES`: Activities to profile (e.g., "CPU,CUDA")
 - `VLLM_PROFILER_RECORD_SHAPES`: Record tensor shapes (true/false)
 - `VLLM_PROFILER_WITH_STACK`: Capture stack traces (true/false)
@@ -290,7 +315,7 @@ Run the complete end-to-end integration test:
 
 ```bash
 # Deploys profiler, creates vLLM pod, runs inference, verifies profiler output
-./test-vllm-integration.sh
+./tests/test-vllm-integration.sh
 ```
 
 This test:
@@ -300,15 +325,7 @@ This test:
 - Runs vLLM serve with a small test model (facebook/opt-125m)
 - Sends a single inference request generating 200 tokens
 - Verifies profiler output in the logs
-- Checks for VLLM_RPC_TIMEOUT environment variable
 - Cleans up all test resources automatically
-
-Environment variables:
-```bash
-VLLM_MODEL=facebook/opt-125m      # Model to test with
-VLLM_IMAGE=vllm/vllm-openai:latest # vLLM image
-TARGET_NAMESPACE=downstream-llm-d  # Namespace
-```
 
 **Feature Tests:**
 
@@ -316,15 +333,15 @@ Test specific profiler features:
 
 ```bash
 # Deploy profiler first
-./deploy.sh
+./scripts/deploy.sh
 
 # Run feature tests
-oc apply -f test-profiler-features.yaml
+oc apply -f tests/test-profiler-features.yaml
 
 # Verify results (check logs, env vars, etc.)
 
 # Cleanup
-oc delete -f test-profiler-features.yaml
+oc delete -f tests/test-profiler-features.yaml
 ```
 
 **Standalone Test:**
@@ -333,7 +350,7 @@ Test the profiler standalone with an existing vLLM pod:
 
 ```bash
 # Requires access to a pod running vLLM
-./test-profiler.sh
+./tests/test-profiler.sh
 ```
 
 ### Customizing Profiler Settings
@@ -343,10 +360,10 @@ Test the profiler standalone with an existing vLLM pod:
 Edit `profiler_config.yaml` and update the ConfigMap:
 
 ```yaml
-profiling_ranges: "200-300"  # Change profiling window
+profiling_ranges: "2000-2010"  # Change profiling window
 activities: "CPU,CUDA"
 options:
-  profile_memory: true       # Enable memory profiling
+  profile_memory: true         # Enable memory profiling
   record_shapes: true
 ```
 
@@ -354,14 +371,12 @@ Then update ConfigMap (no webhook rebuild needed):
 
 ```bash
 # Delete and recreate ConfigMap with updated configuration
-oc delete configmap env-injector-files -n downstream-llm-d
+oc delete configmap env-injector-files -n kserve-e2e-perf
 oc apply -k .
 
 # New pods will automatically get the updated configuration
 # Existing pods need to be restarted to pick up changes
 ```
-
-**Note:** Updating the ConfigMap does not require rebuilding or restarting the webhook. Only the target namespace's ConfigMap is updated.
 
 **Method 2: Per-pod configuration (via annotations):**
 
@@ -370,14 +385,14 @@ Add annotations to your pod spec (no ConfigMap update needed):
 ```yaml
 metadata:
   annotations:
-    vllm.profiler/ranges: "200-300"
+    vllm.profiler/ranges: "2000-2010"
     vllm.profiler/memory: "true"
     vllm.profiler/export-trace: "false"
 ```
 
 **Method 3: Test different configurations:**
 
-See `test-profiler-features.yaml` for examples of different configurations.
+See `tests/test-profiler-features.yaml` for examples of different configurations.
 
 ## Key Features
 
@@ -386,7 +401,7 @@ See `test-profiler-features.yaml` for examples of different configurations.
 The webhook supports multiple label selectors - a pod matching **ANY** of the configured labels will be profiled:
 
 ```yaml
-TARGET_LABELS: "llm-d.ai/inferenceServing=true,app=vllm,vllm.profiler/enabled=true"
+TARGET_LABELS: "vllm-profiler/enabled=true,app=vllm"
 ```
 
 This eliminates the need to rebuild the webhook when adding new pod types to profile.
@@ -396,7 +411,7 @@ This eliminates the need to rebuild the webhook when adding new pod types to pro
 Profile multiple non-contiguous call ranges in a single session:
 
 ```yaml
-vllm.profiler/ranges: "50-100,200-300,500-600"
+vllm.profiler/ranges: "500-510,2000-2010,5000-5010"
 ```
 
 This is useful for:
@@ -427,6 +442,12 @@ Profiling is completely transparent to the application:
 - No application downtime
 - Automatic instrumentation via import hooks
 
+### 6. Multi-Version vLLM Support
+
+The profiler automatically detects and instruments:
+- vLLM >= 0.12: `vllm.v1.worker.gpu_worker.Worker.execute_model`
+- vLLM 0.11.x: `vllm.worker.worker.Worker.execute_model`
+
 ## What Requires Rebuild vs Runtime Update
 
 ### No Rebuild Required ✅
@@ -445,7 +466,7 @@ These changes can be made without rebuilding the webhook container:
 
 3. **Update profiler configuration (ConfigMap):**
    ```bash
-   oc delete configmap env-injector-files -n downstream-llm-d
+   oc delete configmap env-injector-files -n kserve-e2e-perf
    oc apply -k .
    ```
 
@@ -462,7 +483,7 @@ These changes require rebuilding and redeploying the webhook:
 
 To rebuild:
 ```bash
-./deploy.sh  # Rebuilds container image and redeploys
+./scripts/deploy.sh  # Rebuilds container image and redeploys
 ```
 
 ## Troubleshooting
@@ -471,46 +492,55 @@ To rebuild:
 
 Check webhook logs:
 ```bash
-kubectl logs -n vllm-profiler deployment/env-injector
+oc logs -n vllm-profiler deployment/env-injector
 ```
 
 Verify webhook configuration:
 ```bash
-kubectl get mutatingwebhookconfiguration env-injector-webhook -o yaml
+oc get mutatingwebhookconfiguration env-injector-webhook -o yaml
 ```
 
 ### Profiler not loading in pod
 
 Check pod has correct environment:
 ```bash
-kubectl get pod <pod-name> -n downstream-llm-d -o jsonpath='{.spec.containers[0].env}' | jq
+oc get pod <pod-name> -n kserve-e2e-perf -o jsonpath='{.spec.containers[0].env}' | python3 -m json.tool
 ```
 
 Check pod has volume mount:
 ```bash
-kubectl get pod <pod-name> -n downstream-llm-d -o jsonpath='{.spec.containers[0].volumeMounts}' | jq
+oc get pod <pod-name> -n kserve-e2e-perf -o jsonpath='{.spec.containers[0].volumeMounts}' | python3 -m json.tool
 ```
 
-Check pod logs for sitecustomize messages:
+Check pod logs for profiler messages:
 ```bash
-kubectl logs <pod-name> -n downstream-llm-d | grep sitecustomize
+oc logs <pod-name> -n kserve-e2e-perf 2>&1 | grep '\[profiler\]'
 ```
 
 ### Profiler not triggering
 
-The profiler only activates after 100 model execution calls. Send inference requests:
+The profiler only activates after reaching the configured call count (default: call #500). Send enough inference requests to reach that threshold.
+
 ```bash
 # Example with vLLM OpenAI-compatible API
-curl http://<pod-ip>:8000/v1/completions \
+curl http://<service-url>:8080/v1/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "...", "prompt": "Hello", "max_tokens": 100}'
+  -d '{"model": "...", "prompt": "Hello", "max_tokens": 200}'
+```
+
+### caBundle is empty
+
+Re-generate certs and patch:
+```bash
+bash scripts/gen-certs.sh
+bash scripts/patch-ca-bundle.sh
 ```
 
 ### Validation tool
 
 Run comprehensive validation:
 ```bash
-DO_SIMPLE_TEST=1 PROFILER_NS=vllm-profiler TARGET_NS=downstream-llm-d ./validate_webhook.sh
+TARGET_NS=kserve-e2e-perf LABEL_KEY="vllm-profiler/enabled" DO_SIMPLE_TEST=1 ./scripts/validate_webhook.sh
 ```
 
 ## Resources Created
@@ -521,7 +551,7 @@ DO_SIMPLE_TEST=1 PROFILER_NS=vllm-profiler TARGET_NS=downstream-llm-d ./validate
 - ServiceAccount: `env-injector`
 - Secret: `env-injector-certs` (TLS certificates)
 
-**Target Namespace: downstream-llm-d** (configurable)
+**Target Namespace: kserve-e2e-perf** (configurable)
 - ConfigMap: `env-injector-files` (contains sitecustomize.py and profiler_config.yaml)
 
 **Cluster-wide:**
@@ -534,15 +564,3 @@ DO_SIMPLE_TEST=1 PROFILER_NS=vllm-profiler TARGET_NS=downstream-llm-d ./validate
 - Failure policy is `Ignore` - webhook failures won't block pod creation
 - ConfigMap is mounted read-only into pods
 - Profiler code runs with same permissions as vLLM process
-
-## License
-
-See LICENSE file.
-
-## Contributing
-
-Contributions welcome! Please open issues or pull requests on the project repository.
-
-## Support
-
-For issues and questions, please open an issue on GitHub.

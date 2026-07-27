@@ -1,6 +1,6 @@
 configMapGenerator:
 - name: env-injector-files
-  namespace: downstream-llm-d
+  namespace: kserve-e2e-perf
   files:
     - sitecustomize.py
     - profiler_config.yaml
