@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+profiles/**/*.json
+profiles/**/.cache/
+server_configs/
+profiles/
+analysis/
+kubeconfig*
+logs/

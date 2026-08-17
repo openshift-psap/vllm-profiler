@@ -4,6 +4,10 @@ set -euo pipefail
 # vLLM Profiler Webhook Deployment Script
 # Builds, pushes, and deploys the mutating admission webhook for vLLM profiling
 
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$REPO_ROOT"
+
 # Configuration
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-podman}"
 IMAGE_NAME="${IMAGE_NAME:-vllmprofiler}"
@@ -12,8 +16,7 @@ IMAGE_TAG="${IMAGE_TAG:-latest}"
 FULL_IMAGE="${IMAGE_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
 MANIFESTS_FILE="manifests.yaml"
 NAMESPACE="vllm-profiler"
-TARGET_NAMESPACE="${TARGET_NAMESPACE:-downstream-llm-d}"
-TARGET_LABELS="${TARGET_LABELS:-llm-d.ai/inferenceServing=true,app.kubernetes.io/component=llminferenceservice-workload}"
+TARGET_NAMESPACE="${TARGET_NAMESPACE:-kserve-e2e-perf}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -55,7 +58,6 @@ Environment Variables:
     IMAGE_REGISTRY      Image registry (default: quay.io/mimehta)
     IMAGE_TAG           Image tag (default: latest)
     TARGET_NAMESPACE    Namespace to inject profiler into (default: downstream-llm-d)
-    TARGET_LABELS       Labels to match for injection (default: llm-d.ai/inferenceServing=true,app.kubernetes.io/component=llminferenceservice-workload)
 
 Examples:
     # Full deployment
@@ -66,9 +68,6 @@ Examples:
 
     # Use different namespace
     TARGET_NAMESPACE=my-namespace $0
-
-    # Use custom namespace and labels
-    TARGET_NAMESPACE=my-namespace TARGET_LABELS="app=myapp" $0
 
 EOF
     exit 0
@@ -106,12 +105,11 @@ main() {
     echo "  - Image: ${FULL_IMAGE}"
     echo "  - Webhook Namespace: ${NAMESPACE}"
     echo "  - Target Namespace: ${TARGET_NAMESPACE}"
-    echo "  - Target Labels: ${TARGET_LABELS}"
     echo ""
 
     # Step 1: Build and push container image
     if [ "$SKIP_BUILD" = false ]; then
-        log_info "Step 1/8: Building container image..."
+        log_info "Step 1/7: Building container image..."
         if ! ${CONTAINER_RUNTIME} build --runtime=runc -t "${IMAGE_NAME}" .; then
             log_error "Container build failed"
             exit 1
@@ -132,65 +130,48 @@ main() {
     fi
 
     # Step 2: Delete existing resources (idempotent deployment)
-    log_info "Step 2/8: Removing existing resources (if any)..."
+    log_info "Step 2/7: Removing existing resources (if any)..."
     oc delete -f "${MANIFESTS_FILE}" --ignore-not-found=true
     log_info "Waiting for resources to be deleted..."
     sleep 5
     log_success "Existing resources removed"
 
-    # Step 2.5: Update manifests and kustomization with TARGET_NAMESPACE and TARGET_LABELS
-    log_info "Updating configuration files..."
-    log_info "  TARGET_NAMESPACE=${TARGET_NAMESPACE}"
-    log_info "  TARGET_LABELS=${TARGET_LABELS}"
-    # Update manifests.yaml TARGET_NAMESPACE env var
-    sed -i "s/value: \"downstream-llm-d\"/value: \"${TARGET_NAMESPACE}\"/g" "${MANIFESTS_FILE}"
-    # Update manifests.yaml TARGET_LABELS env var
-    sed -i "s|value: \"llm-d.ai/inferenceServing=true,app.kubernetes.io/component=llminferenceservice-workload\"|value: \"${TARGET_LABELS}\"|g" "${MANIFESTS_FILE}"
-    # Update kustomization.yaml namespace
-    sed -i "s/namespace: downstream-llm-d/namespace: ${TARGET_NAMESPACE}/g" kustomization.yaml
-    log_success "Configuration files updated"
-
-    # Step 3: Create namespace (needed before cert generation)
-    log_info "Step 3/8: Creating namespace ${NAMESPACE}..."
-    oc create namespace "${NAMESPACE}" --dry-run=client -o yaml | oc apply -f -
-    log_success "Namespace ready"
-
-    # Step 4: Generate TLS certificates (before deploying webhook)
-    log_info "Step 4/8: Generating TLS certificates..."
-    if ! bash gen-certs.sh; then
-        log_error "Certificate generation failed"
-        exit 1
-    fi
-    log_success "TLS certificates generated"
-
-    # Step 5: Apply manifests (now secret exists)
-    log_info "Step 5/8: Deploying webhook resources..."
+    # Step 3: Apply manifests
+    log_info "Step 3/7: Deploying webhook resources..."
     if ! oc apply -f "${MANIFESTS_FILE}"; then
         log_error "Failed to apply manifests"
         exit 1
     fi
     log_success "Webhook resources deployed"
 
-    # Step 6: Apply kustomization (ConfigMap)
-    log_info "Step 6/8: Creating ConfigMap with profiler code..."
+    # Step 4: Apply kustomization (ConfigMap)
+    log_info "Step 4/7: Creating ConfigMap with profiler code..."
     if ! oc apply -k .; then
         log_error "Failed to apply kustomization"
         exit 1
     fi
     log_success "ConfigMap created in ${TARGET_NAMESPACE}"
 
-    # Step 7: Patch webhook with CA bundle
-    log_info "Step 7/8: Patching webhook with CA bundle..."
-    if ! bash patch-ca-bundle.sh; then
+    # Step 5: Generate TLS certificates
+    log_info "Step 5/7: Generating TLS certificates..."
+    if ! bash "${SCRIPT_DIR}/gen-certs.sh"; then
+        log_error "Certificate generation failed"
+        exit 1
+    fi
+    log_success "TLS certificates generated"
+
+    # Step 6: Patch webhook with CA bundle
+    log_info "Step 6/7: Patching webhook with CA bundle..."
+    if ! bash "${SCRIPT_DIR}/patch-ca-bundle.sh"; then
         log_error "CA bundle patching failed"
         exit 1
     fi
     log_success "Webhook CA bundle configured"
 
-    # Step 8: Validate deployment
+    # Step 7: Validate deployment
     if [ "$SKIP_VALIDATION" = false ]; then
-        log_info "Step 8/8: Validating webhook deployment..."
-        if ! DO_SIMPLE_TEST=1 ./validate_webhook.sh; then
+        log_info "Step 7/7: Validating webhook deployment..."
+        if ! DO_SIMPLE_TEST=1 "${SCRIPT_DIR}/validate_webhook.sh"; then
             log_warn "Webhook validation reported issues (see output above)"
         else
             log_success "Webhook validation passed"
@@ -208,7 +189,7 @@ main() {
     echo "  2. Check pod logs for profiler output after ~100-150 model executions"
     echo "  3. Retrieve trace file from pod for Chrome trace visualization"
     echo ""
-    log_info "To remove all resources, run: ./teardown.sh"
+    log_info "To remove all resources, run: ./scripts/teardown.sh"
 }
 
 # Run main function
