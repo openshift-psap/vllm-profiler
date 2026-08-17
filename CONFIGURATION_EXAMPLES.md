@@ -21,7 +21,7 @@ profiling_ranges: "500-510,2000-2010"  # Multiple ranges!
 activities: "CPU,CUDA"
 options:
   record_shapes: true
-  with_stack: false    # Disabled by default to reduce overhead
+  with_stack: true     # Enables attributing perf changes to code paths
   profile_memory: false
 output:
   export_chrome_trace: true
@@ -119,9 +119,9 @@ Specify which model execution calls to profile:
 
 | Method | Example | Effect |
 |--------|---------|--------|
-| ConfigMap | `profiling_ranges: "500-510"` | Profile calls 500-510 |
-| Annotation | `vllm.profiler/ranges: "500-510,2000-2010"` | Profile 500-510 AND 2000-2010 |
-| Env Var | `VLLM_PROFILER_RANGES="500-510"` | Profile calls 500-510 |
+| ConfigMap | `profiling_ranges: "500-503"` | Profile calls 500-503 |
+| Annotation | `vllm.profiler/ranges: "500-503,2000-2003"` | Profile 500-503 AND 2000-2003 |
+| Env Var | `VLLM_PROFILER_RANGES="500-503"` | Profile calls 500-503 |
 
 **Format:** `"start-end"` or `"start1-end1,start2-end2,..."` for multiple ranges.
 
@@ -166,11 +166,11 @@ Customize the output trace filename:
 
 ### Use Case 1: Steady-state profiling (default)
 
-Profile 10 forward passes after warmup completes (JIT compilation finishes within ~50 passes, so 500 is well into steady state):
+Profile 3 forward passes after warmup completes (JIT compilation finishes within ~50 passes, so 500 is well into steady state). 3 passes keeps trace files small while capturing representative behavior:
 
 **ConfigMap (current default):**
 ```yaml
-profiling_ranges: "500-510"
+profiling_ranges: "500-503"
 ```
 
 ### Use Case 2: Profile multiple windows
@@ -267,9 +267,9 @@ oc logs -f <pod-name> -n kserve-e2e-perf 2>&1 | grep '\[profiler\]'
 
 Expected output:
 ```
-[profiler] Starting profiler for range 500-510 (call #500)
-[profiler] Stopping profiler for range 500-510 (call #510)
-[profiler] Exported trace to: /tmp/trace_rank0_pid455_range500-510.json
+[profiler] Starting profiler for range 500-503 (call #500)
+[profiler] Stopping profiler for range 500-503 (call #503)
+[profiler] Exported trace to: /tmp/trace_rank0_pid455_range500-503.json
 ```
 
 ## Changing Configuration Without Rebuilding
@@ -343,7 +343,7 @@ oc get configmap env-injector-files -n kserve-e2e-perf \
 1. **Use ConfigMap for defaults** - Set sensible defaults in profiler_config.yaml
 2. **Use annotations for customization** - Override per pod as needed
 3. **Start with conservative ranges** - Use narrow ranges initially (10 calls), expand as needed
-4. **Disable stack traces under load** - `with_stack: false` significantly reduces overhead
+4. **Stack traces enabled by default** - `with_stack: true` helps attribute perf changes to specific code paths
 5. **Use the gate file mechanism** - The counter resets on gate activation, making the same range reusable
 6. **Enable debug mode during testing** - Helps verify configuration is applied correctly
 7. **Use per-rank output patterns** - Always include `{rank}` in file_pattern for TP deployments

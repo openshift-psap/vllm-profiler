@@ -114,16 +114,28 @@ After editing `profiler_config.yaml` or `sitecustomize.py`:
 ```bash
 export KUBECONFIG=/path/to/kubeconfig
 
-# Delete and recreate the ConfigMap
-oc delete configmap env-injector-files -n kserve-e2e-perf
+# Update the ConfigMap with new config
 oc apply -k .
+
+# Restart the webhook deployment to pick up changes
+oc rollout restart deployment/env-injector -n vllm-profiler
+oc rollout status deployment/env-injector -n vllm-profiler
 
 # Restart any running vLLM pods to pick up new config
 oc delete inferenceservice <name> -n kserve-e2e-perf
 oc apply -f server_configs/<config>.yaml
 ```
 
-The webhook itself does NOT need restarting when profiler config changes.
+To update all clusters at once, repeat the above for each KUBECONFIG.
+
+### Current Defaults
+
+| Setting | Value | Rationale |
+|---------|-------|-----------|
+| `profiling_ranges` | `"500-503"` | 3 forward passes in steady state (past JIT warmup), keeps trace files small |
+| `with_stack` | `true` | Enables attributing perf changes to specific code paths |
+| `activities` | `"CPU,CUDA"` | Profiles both CPU and GPU operations |
+| `profile_memory` | `false` | Reduces overhead; enable only when investigating memory issues |
 
 ---
 
@@ -140,7 +152,7 @@ oc get pods -n kserve-e2e-perf -w
 
 # 3. Verify profiler loaded
 oc logs -n kserve-e2e-perf <pod-name> -f 2>&1 | grep '\[profiler\]'
-# Expected: "[profiler] vLLM profiler installed - will profile ranges: [(500, 510)]"
+# Expected: "[profiler] vLLM profiler installed - will profile ranges: [(500, 503)]"
 
 # 4. Send traffic to trigger profiling (need to reach call count in profiling_ranges)
 # Use guidellm, curl, or any load generator
@@ -188,7 +200,27 @@ TARGET_NAMESPACE=kserve-e2e-perf ./scripts/teardown.sh --force
 
 ---
 
+## Available Clusters
 
+Kubeconfig files in the repo root (`kubeconfig-*`) provide access to the OCP clusters. The profiler infrastructure is deployed on all of them.
+
+To verify access:
+```bash
+KUBECONFIG=kubeconfig-<name> oc whoami
+KUBECONFIG=kubeconfig-<name> oc get pods -n vllm-profiler
+```
+
+To update config across all clusters:
+```bash
+for kc in kubeconfig-*; do
+  echo "--- Updating $kc ---"
+  KUBECONFIG=$kc oc apply -k .
+  KUBECONFIG=$kc oc rollout restart deployment/env-injector -n vllm-profiler
+  KUBECONFIG=$kc oc rollout status deployment/env-injector -n vllm-profiler
+done
+```
+
+---
 
 ## Label Matching
 

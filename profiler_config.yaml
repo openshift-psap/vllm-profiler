@@ -10,13 +10,14 @@
 #   "50-100,200-300"    - Profile calls 50-100 AND 200-300
 #   "0-50"              - Profile first 50 calls
 #
-# - Window (500-510): Steady state profiling (10 calls)
+# - Window (500-503): Steady state profiling (3 forward passes)
 #   All JIT compilation finishes within the first ~50 forward passes,
 #   so 500 is well past warmup and in steady state.
+#   3 passes keeps trace files small while capturing representative behavior.
 #   The gate file (/tmp/profiler_gate) controls when counting is active.
 #   Counter resets each time the gate is activated, so the same range
 #   works for every profile run regardless of model speed.
-profiling_ranges: "500-510"
+profiling_ranges: "500-503"
 
 # Torch profiler activities to record
 # Available: CPU, CUDA
@@ -28,8 +29,8 @@ options:
   # Record tensor shapes in trace
   record_shapes: true
 
-  # Capture Python stack traces (disabled to reduce overhead under high load)
-  with_stack: false
+  # Capture Python stack traces (enables attributing perf changes to specific code paths)
+  with_stack: true
 
   # Profile memory allocations (adds overhead)
   profile_memory: false

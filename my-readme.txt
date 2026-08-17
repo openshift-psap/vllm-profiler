@@ -445,19 +445,19 @@ Assuming the webhook is already deployed (see section 4 to verify):
   Three ways to set it (in increasing priority, highest wins):
 
     1. profiler_config.yaml (applies to all pods):
-         profiling_ranges: "500-510"
+         profiling_ranges: "500-503"
 
     2. Pod annotation (per-pod override):
          annotations:
-           vllm.profiler/ranges: "500-510"
+           vllm.profiler/ranges: "500-503"
 
     3. Environment variable (highest priority):
          env:
            - name: VLLM_PROFILER_RANGES
-             value: "500-510"
+             value: "500-503"
 
   Multiple windows:
-    profiling_ranges: "500-510,2000-2010"
+    profiling_ranges: "500-503,2000-2003"
 
   --- Other Settings ---
 

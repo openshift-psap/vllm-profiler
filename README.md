@@ -19,7 +19,7 @@ This system enables real-time torch profiling of vLLM model execution without re
 │ User creates Pod with matching label:           │
 │  - vllm-profiler/enabled=true                   │
 │ Optional annotations for configuration:         │
-│  - vllm.profiler/ranges="500-510"               │
+│  - vllm.profiler/ranges="500-503"               │
 │  - vllm.profiler/export-trace="false"           │
 └────────────────┬────────────────────────────────┘
                  │
@@ -48,7 +48,7 @@ This system enables real-time torch profiling of vLLM model execution without re
                  │
                  ▼
 ┌─────────────────────────────────────────────────┐
-│ Profiler runs on configured ranges (e.g. 500-510│
+│ Profiler runs on configured ranges (e.g. 500-503│
 │  Exports: /tmp/trace_rank{rank}_pid{pid}.json   │
 └─────────────────────────────────────────────────┘
 ```
@@ -155,17 +155,17 @@ spec:
 
 ### View Profiler Output
 
-The profiler activates after the configured number of model execution calls (default: call #500):
+The profiler activates after the configured number of model execution calls (default: calls #500-503):
 
 ```bash
 # Watch for profiler output
 oc logs -n kserve-e2e-perf <pod-name> -f 2>&1 | grep '\[profiler\]'
 
 # Expected sequence:
-# [profiler] vLLM profiler installed - will profile ranges: [(500, 510)]
-# [profiler] Starting profiler for range 500-510 (call #500)
-# [profiler] Stopping profiler for range 500-510 (call #510)
-# [profiler] Exported trace to: /tmp/trace_rank0_pid455_range500-510.json
+# [profiler] vLLM profiler installed - will profile ranges: [(500, 503)]
+# [profiler] Starting profiler for range 500-503 (call #500)
+# [profiler] Stopping profiler for range 500-503 (call #503)
+# [profiler] Exported trace to: /tmp/trace_rank0_pid455_range500-503.json
 
 # Retrieve trace files
 oc exec -n kserve-e2e-perf <pod-name> -c kserve-container -- \
@@ -252,11 +252,11 @@ Configuration is managed via `ProfilerConfig` class with multi-source support:
 
 **Default settings** (from profiler_config.yaml):
 ```yaml
-profiling_ranges: "500-510"     # Steady-state profiling (10 forward passes)
+profiling_ranges: "500-503"     # Steady-state profiling (3 forward passes)
 activities: "CPU,CUDA"
 options:
   record_shapes: true
-  with_stack: false             # Disabled to reduce overhead under load
+  with_stack: true              # Enables attributing perf changes to code paths
   profile_memory: false
 output:
   export_chrome_trace: true
@@ -298,7 +298,7 @@ See [CONFIGURATION_EXAMPLES.md](CONFIGURATION_EXAMPLES.md) for comprehensive con
 - `TARGET_NAMESPACE`: Target namespace for ConfigMap (default: "kserve-e2e-perf")
 
 **Profiler Configuration (injected via pod annotations or set manually):**
-- `VLLM_PROFILER_RANGES`: Profiling call ranges (e.g., "500-510" or "500-510,2000-2010")
+- `VLLM_PROFILER_RANGES`: Profiling call ranges (e.g., "500-503" or "500-503,2000-2003")
 - `VLLM_PROFILER_ACTIVITIES`: Activities to profile (e.g., "CPU,CUDA")
 - `VLLM_PROFILER_RECORD_SHAPES`: Record tensor shapes (true/false)
 - `VLLM_PROFILER_WITH_STACK`: Capture stack traces (true/false)
